@@ -18,8 +18,12 @@ if [ "$(id -u)" -eq 0 ]; then
     echo "try:     blinky pattern heartbeat"
 else
     install -Dm755 blinky "$HOME/.local/bin/blinky"
+    install -Dm644 systemd/blinky.service "$HOME/.config/systemd/user/blinky.service"
+    install -Dm644 systemd/blinky-webcam.service "$HOME/.config/systemd/user/blinky-webcam.service"
+    systemctl --user daemon-reload 2>/dev/null || true
     echo "binary installed to ~/.local/bin/blinky"
+    echo "systemd units installed to ~/.config/systemd/user/"
     echo
-    echo "LED access still needs one root run:"
+    echo "LED access still needs one root run (if not already done):"
     echo "  sudo $(pwd)/install.sh"
 fi

@@ -1,5 +1,5 @@
 [Unit]
-Description=blinky ThinkLight agent status indicator
+Description=blinky agent status indicator (power LED & status LEDs)
 
 [Service]
 ExecStart=%h/.local/bin/blinky daemon

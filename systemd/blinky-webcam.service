@@ -1,0 +1,12 @@
+[Unit]
+Description=blinky webcam agent status indicator watcher
+After=blinky.service
+PartOf=blinky.service
+
+[Service]
+ExecStart=%h/.local/bin/blinky webcam watch
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

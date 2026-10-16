@@ -95,33 +95,14 @@ static double clamp01(double v)
 	return v < 0 ? 0 : (v > 1 ? 1 : v);
 }
 
-// One thump: fast attack, exponential decay.  x is ms since beat start.
-static double beat(double x)
+// Slow steady blink, fade in and out.
+// Period ~2.2s.  Uses perceptual gamma curve for a smooth swell and decay.
+static double slow_fade(double t_ms)
 {
-	const double attack = 28.0; /* ms */
-	const double decay = 170.0; /* ms time constant */
-	if (x < 0)
-		return 0;
-	if (x < attack)
-		return x / attack;
-	return exp(-(x - attack) / decay);
-}
-
-// Two-thump cardiac envelope, ~55 bpm.  Returns 0..1 duty.
-static double heartbeat(double t_ms)
-{
-	const double period = 1100.0;
+	const double period = 2200.0;
 	double u = fmod(t_ms, period);
-	double v = beat(u) + 0.72 * beat(u - 300.0);
-	return clamp01(v);
-}
-
-// Slow breathing for "working".
-static double breath(double t_ms)
-{
-	const double period = 2600.0;
-	double u = fmod(t_ms, period);
-	return 0.5 - 0.5 * cos(2.0 * M_PI * u / period);
+	double v = 0.5 - 0.5 * cos(2.0 * M_PI * u / period);
+	return v * v;
 }
 
 // Triple blink for "waiting for you".
@@ -172,8 +153,10 @@ static double pattern_duty(int p, double t_ms, bool pwm)
 	double d;
 	switch (p) {
 	case P_OFF: return 0.0;
-	case P_RUNNING: d = pwm ? 0.10 + 0.90 * breath(t_ms) : (breath(t_ms) > 0.35 ? 1.0 : 0.0); break;
-	case P_HEARTBEAT: d = pwm ? 0.03 + 0.97 * heartbeat(t_ms) : (heartbeat(t_ms) > 0.18 ? 1.0 : 0.0); break;
+	case P_RUNNING:
+	case P_HEARTBEAT:
+		d = pwm ? slow_fade(t_ms) : (slow_fade(t_ms) > 0.25 ? 1.0 : 0.0);
+		break;
 	case P_NEEDS: d = needs_blink(t_ms); break;
 	case P_DONE: d = done_flash(t_ms); break;
 	case P_ERROR: d = sos(t_ms); break;
@@ -187,6 +170,7 @@ static double pattern_duty(int p, double t_ms, bool pwm)
 struct led {
 	int fd;
 	int shadow; /* last written value, -1 unknown */
+	int initial_state; /* value before blinky touched it, 0 or 1 */
 	char path[256];
 	bool warned;
 };
@@ -219,6 +203,20 @@ static const char *LED_CANDIDATES[] = {
 	"tpacpi::standby",
 	NULL,
 };
+
+static int led_read_state(const char *path)
+{
+	int fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return 0;
+	char buf[16];
+	ssize_t n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0)
+		return 0;
+	buf[n] = '\0';
+	return atoi(buf) > 0 ? 1 : 0;
+}
 
 static void led_write(struct led *l, int on)
 {
@@ -264,7 +262,7 @@ static double led_calibrate(struct led *l)
 				best = hz;
 		}
 	}
-	led_write(l, 0);
+	led_write(l, l->initial_state);
 	return best;
 }
 
@@ -275,6 +273,7 @@ static struct led *led_open(struct led *arr, int *n, const char *path)
 	struct led *l = &arr[*n];
 	memset(l, 0, sizeof(*l));
 	snprintf(l->path, sizeof(l->path), "%s", path);
+	l->initial_state = led_read_state(path);
 	l->fd = open(path, O_WRONLY);
 	l->shadow = -1;
 	if (l->fd < 0)
@@ -372,6 +371,8 @@ struct paths {
 	char status[600];
 	char log[600];
 	char calib[600];
+	char webcam_pid[600];
+	char webcam_watch_pid[600];
 };
 
 static void make_paths(struct paths *p)
@@ -391,6 +392,8 @@ static void make_paths(struct paths *p)
 	snprintf(p->status, sizeof(p->status), "%s/status", p->dir);
 	snprintf(p->log, sizeof(p->log), "%s/log", p->dir);
 	snprintf(p->calib, sizeof(p->calib), "%s/calib", p->dir);
+	snprintf(p->webcam_pid, sizeof(p->webcam_pid), "%s/webcam.pid", p->dir);
+	snprintf(p->webcam_watch_pid, sizeof(p->webcam_watch_pid), "%s/webcam_watch.pid", p->dir);
 }
 
 static bool dir_ready(const struct paths *p)
@@ -406,6 +409,15 @@ static void on_signal(int sig)
 {
 	(void)sig;
 	g_stop = 1;
+}
+
+static void write_pid(const char *path, pid_t pid)
+{
+	FILE *f = fopen(path, "w");
+	if (f) {
+		fprintf(f, "%ld\n", (long)pid);
+		fclose(f);
+	}
 }
 
 static pid_t read_pid(const char *path)
@@ -494,7 +506,7 @@ static int cmd_daemon(void)
 			"blinky: no writable LED found (BLINKY_LED=%s)\n"
 			"        run ./install.sh once (root) to grant access via udev,\n"
 			"        then `blinky probe` to see what is usable.\n",
-			spec && *spec ? spec : "auto");
+			spec && *spec ? spec : "tpacpi::power");
 		return 1;
 	}
 
@@ -548,11 +560,7 @@ static int cmd_daemon(void)
 		return 1;
 	}
 
-	FILE *pf = fopen(p.pid, "w");
-	if (pf) {
-		fprintf(pf, "%ld\n", (long)getpid());
-		fclose(pf);
-	}
+	write_pid(p.pid, getpid());
 
 	signal(SIGTERM, on_signal);
 	signal(SIGINT, on_signal);
@@ -610,7 +618,11 @@ static int cmd_daemon(void)
 		double t_ms = (double)(now_ns() - t0) / 1e6;
 		double duty = pattern_duty(dom, t_ms, pwm);
 
-		if (!pwm) {
+		if (dom == P_OFF) {
+			for (int i = 0; i < w.nleds; i++)
+				led_write(&w.leds[i], w.leds[i].initial_state);
+			sleep_ms(frame_ms);
+		} else if (!pwm) {
 			leds_write(&w, duty > 0.5);
 		} else {
 			double on_ms = duty * frame_ms;
@@ -633,9 +645,10 @@ static int cmd_daemon(void)
 			next = now_ns();
 	}
 
-	leds_write(&w, 0);
-	for (int i = 0; i < w.nleds; i++)
+	for (int i = 0; i < w.nleds; i++) {
+		led_write(&w.leds[i], w.leds[i].initial_state);
 		close(w.leds[i].fd);
+	}
 	close(fifo);
 	unlink(p.fifo);
 	unlink(p.pid);
@@ -648,7 +661,9 @@ static int cmd_daemon(void)
 static int leds_configure(struct world *w, const char *spec)
 {
 	w->nleds = 0;
-	if (!spec || !*spec || !strcmp(spec, "auto") || !strcmp(spec, "all")) {
+	if (!spec || !*spec)
+		spec = "tpacpi::power";
+	if (!strcmp(spec, "auto") || !strcmp(spec, "all")) {
 		for (int i = 0; LED_CANDIDATES[i]; i++) {
 			char path[256];
 			resolve_led(LED_CANDIDATES[i], path, sizeof(path));
@@ -717,6 +732,20 @@ static int cmd_stop(void)
 {
 	struct paths p;
 	make_paths(&p);
+	pid_t wpid = read_pid(p.webcam_watch_pid);
+	if (pid_alive(wpid)) {
+		kill(wpid, SIGTERM);
+		for (int i = 0; i < 20 && pid_alive(wpid); i++)
+			sleep_ms(50);
+		unlink(p.webcam_watch_pid);
+	}
+	pid_t cpid = read_pid(p.webcam_pid);
+	if (pid_alive(cpid)) {
+		kill(cpid, SIGTERM);
+		for (int i = 0; i < 20 && pid_alive(cpid); i++)
+			sleep_ms(50);
+		unlink(p.webcam_pid);
+	}
 	pid_t pid = read_pid(p.pid);
 	if (!pid_alive(pid)) {
 		printf("blinky: not running\n");
@@ -745,6 +774,12 @@ static int cmd_status(void)
 		}
 		close(fd);
 	}
+	pid_t wpid = read_pid(p.webcam_watch_pid);
+	if (pid_alive(wpid))
+		printf("webcam watcher: running (pid %ld)\n", (long)wpid);
+	pid_t cpid = read_pid(p.webcam_pid);
+	if (pid_alive(cpid))
+		printf("webcam streamer: streaming (pid %ld)\n", (long)cpid);
 	return 0;
 }
 
@@ -793,7 +828,8 @@ static int cmd_probe(void)
 	for (int i = 0; LED_CANDIDATES[i]; i++) {
 		char path[256];
 		resolve_led(LED_CANDIDATES[i], path, sizeof(path));
-		struct led l = { .fd = open(path, O_WRONLY), .shadow = -1 };
+		int orig = led_read_state(path);
+		struct led l = { .fd = open(path, O_WRONLY), .shadow = -1, .initial_state = orig };
 		snprintf(l.path, sizeof(l.path), "%s", path);
 		if (l.fd < 0) {
 			printf("%-26s %-10s %-12s %s\n", LED_CANDIDATES[i], "denied", "-", "-");
@@ -813,12 +849,231 @@ static int cmd_probe(void)
 			}
 			close(rfd);
 		}
-		led_write(&l, 0);
+		led_write(&l, orig);
 		printf("%-26s %-10s %-12.0f %s\n", LED_CANDIDATES[i], "ok", hz, rb);
 		close(l.fd);
 	}
 	printf("\nnote: tpacpi::thinklight only accepts 0 (off) on xx30 hardware.\n");
 	return 0;
+}
+
+/* ------------------------------------------------------------------ webcam */
+
+static volatile sig_atomic_t g_webcam_stop = 0;
+
+static void on_webcam_sig(int sig)
+{
+	(void)sig;
+	g_webcam_stop = 1;
+}
+
+static pid_t webcam_start(const char *dev)
+{
+	pid_t pid = fork();
+	if (pid < 0)
+		return -1;
+	if (pid == 0) {
+		setsid();
+		int devnull = open("/dev/null", O_RDWR);
+		if (devnull >= 0) {
+			dup2(devnull, STDIN_FILENO);
+			dup2(devnull, STDOUT_FILENO);
+			dup2(devnull, STDERR_FILENO);
+			if (devnull > 2)
+				close(devnull);
+		}
+		execlp("v4l2-ctl", "v4l2-ctl", "-d", dev, "--stream-mmap", "--stream-count=0", (char *)NULL);
+		_exit(127);
+	}
+	return pid;
+}
+
+static void webcam_stop(pid_t *pid_ptr)
+{
+	if (!pid_ptr || *pid_ptr <= 0)
+		return;
+	pid_t pid = *pid_ptr;
+	*pid_ptr = -1;
+	kill(pid, SIGTERM);
+	kill(-pid, SIGTERM);
+	for (int i = 0; i < 20; i++) {
+		int st;
+		pid_t wr = waitpid(pid, &st, WNOHANG);
+		if (wr == pid)
+			return;
+		if (wr < 0 && errno == ECHILD) {
+			if (!pid_alive(pid))
+				return;
+		}
+		sleep_ms(25);
+	}
+	kill(pid, SIGKILL);
+	kill(-pid, SIGKILL);
+	int st;
+	waitpid(pid, &st, WNOHANG);
+}
+
+static bool state_in_list(const char *state, const char *list)
+{
+	if (!state || !*state || !list || !*list)
+		return false;
+	const char *p = list;
+	size_t slen = strlen(state);
+	while (*p) {
+		while (*p == ' ' || *p == ',')
+			p++;
+		if (!*p)
+			break;
+		const char *end = strchr(p, ',');
+		size_t len = end ? (size_t)(end - p) : strlen(p);
+		while (len > 0 && p[len - 1] == ' ')
+			len--;
+		if (len == slen && strncmp(p, state, slen) == 0)
+			return true;
+		p += (end ? (size_t)(end - p + 1) : len);
+	}
+	return false;
+}
+
+static int cmd_webcam(int argc, char **argv)
+{
+	if (argc < 1) {
+		fprintf(stderr, "usage: blinky webcam on|off|watch|status [dev]\n");
+		return 2;
+	}
+	const char *sub = argv[0];
+	const char *dev = (argc >= 2) ? argv[1] : getenv("BLINKY_WEBCAM_DEV");
+	if (!dev || !*dev)
+		dev = "/dev/video0";
+
+	struct paths p;
+	make_paths(&p);
+	if (!dir_ready(&p))
+		return 1;
+
+	if (!strcmp(sub, "on")) {
+		pid_t pid = read_pid(p.webcam_pid);
+		if (pid_alive(pid)) {
+			printf("webcam: already running (pid %ld)\n", (long)pid);
+			return 0;
+		}
+		pid = webcam_start(dev);
+		if (pid <= 0) {
+			fprintf(stderr, "blinky: failed to start streamer on %s\n", dev);
+			return 1;
+		}
+		sleep_ms(60);
+		int st;
+		if (waitpid(pid, &st, WNOHANG) == pid) {
+			fprintf(stderr, "blinky: streamer exited immediately on %s\n", dev);
+			return 1;
+		}
+		write_pid(p.webcam_pid, pid);
+		printf("webcam: streaming on %s (pid %ld)\n", dev, (long)pid);
+		return 0;
+	}
+	if (!strcmp(sub, "off")) {
+		pid_t pid = read_pid(p.webcam_pid);
+		if (!pid_alive(pid)) {
+			printf("webcam: not streaming\n");
+			unlink(p.webcam_pid);
+			return 0;
+		}
+		webcam_stop(&pid);
+		unlink(p.webcam_pid);
+		printf("webcam: stopped\n");
+		return 0;
+	}
+	if (!strcmp(sub, "status")) {
+		pid_t pid = read_pid(p.webcam_pid);
+		if (pid_alive(pid))
+			printf("webcam: streaming (pid %ld)\n", (long)pid);
+		else
+			printf("webcam: off\n");
+		return 0;
+	}
+	if (!strcmp(sub, "watch")) {
+		pid_t old_watch = read_pid(p.webcam_watch_pid);
+		if (pid_alive(old_watch) && old_watch != getpid()) {
+			fprintf(stderr, "blinky: webcam watch already running (pid %ld)\n", (long)old_watch);
+			return 0;
+		}
+		write_pid(p.webcam_watch_pid, getpid());
+
+		signal(SIGINT, on_webcam_sig);
+		signal(SIGTERM, on_webcam_sig);
+		signal(SIGHUP, on_webcam_sig);
+
+		const char *states = getenv("BLINKY_WEBCAM_STATES");
+		if (!states || !*states)
+			states = "needs-input,error";
+
+		pid_t child_pid = -1;
+		uint64_t retry_after = 0;
+
+		while (!g_webcam_stop) {
+			sleep_ms(300);
+			if (g_webcam_stop)
+				break;
+
+			if (child_pid > 0) {
+				int st;
+				pid_t wr = waitpid(child_pid, &st, WNOHANG);
+				if (wr == child_pid) {
+					child_pid = -1;
+					unlink(p.webcam_pid);
+					retry_after = now_ns() + 2000000000ull; /* 2s backoff */
+				}
+			}
+
+			char pat[256] = "off";
+			int sfd = open(p.status, O_RDONLY);
+			if (sfd >= 0) {
+				char buf[256];
+				ssize_t n = read(sfd, buf, sizeof(buf) - 1);
+				if (n > 0) {
+					buf[n] = '\0';
+					char *space = strpbrk(buf, " \t\r\n");
+					if (space)
+						*space = '\0';
+					snprintf(pat, sizeof(pat), "%s", buf);
+				}
+				close(sfd);
+			}
+
+			bool should_stream = state_in_list(pat, states);
+			if (should_stream) {
+				if (child_pid <= 0 && now_ns() >= retry_after) {
+					child_pid = webcam_start(dev);
+					if (child_pid > 0) {
+						sleep_ms(60);
+						int st;
+						if (waitpid(child_pid, &st, WNOHANG) == child_pid) {
+							child_pid = -1;
+							retry_after = now_ns() + 2000000000ull;
+						} else {
+							write_pid(p.webcam_pid, child_pid);
+						}
+					}
+				}
+			} else {
+				if (child_pid > 0) {
+					webcam_stop(&child_pid);
+					unlink(p.webcam_pid);
+				}
+			}
+		}
+
+		if (child_pid > 0) {
+			webcam_stop(&child_pid);
+			unlink(p.webcam_pid);
+		}
+		unlink(p.webcam_watch_pid);
+		return 0;
+	}
+
+	fprintf(stderr, "blinky: unknown webcam subcommand '%s'\n", sub);
+	return 2;
 }
 
 static void usage(void)
@@ -833,9 +1088,11 @@ static void usage(void)
 		"  led on|off            raw write, bypasses the daemon\n"
 		"  calibrate             measure max toggle rate / PWM feasibility\n"
 		"  probe                 list LEDs, access and toggle rate\n"
+		"  webcam on|off|watch|status [dev]\n"
 		"  daemon                run in the foreground\n"
-		"env: BLINKY_LED (auto | tpacpi::thinkvantage,tpacpi::power | path,...)\n"
-		"     BLINKY_BASE BLINKY_PWM BLINKY_PWM_HZ BLINKY_RECALIBRATE\n");
+		"env: BLINKY_LED (default tpacpi::power | auto | tpacpi::...,... | path,...)\n"
+		"     BLINKY_BASE BLINKY_PWM BLINKY_PWM_HZ BLINKY_RECALIBRATE\n"
+		"     BLINKY_WEBCAM_DEV BLINKY_WEBCAM_STATES\n");
 }
 
 int main(int argc, char **argv)
@@ -853,6 +1110,8 @@ int main(int argc, char **argv)
 		return cmd_probe();
 	if (!strcmp(cmd, "led"))
 		return cmd_led(argc - 2, argv + 2);
+	if (!strcmp(cmd, "webcam"))
+		return cmd_webcam(argc - 2, argv + 2);
 	if (!strcmp(cmd, "status"))
 		return cmd_status();
 	if (!strcmp(cmd, "stop"))

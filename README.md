@@ -1,135 +1,139 @@
 # blinky
 
-ThinkPad ThinkLight as an agent status indicator.
+ThinkPad status LEDs and webcam indicator for coding agents.
 
-`blinky` turns the lid flood light (`tpacpi::thinklight`) into a status lamp for
-coding agents: a dimming heartbeat while an agent works, a triple blink when one
-waits for your input, flashes when one finishes.
-
-The ThinkLight is a **binary** LED (`max_brightness = 1`): no hardware dimming and
-no hardware blink. `blinky` fakes a dimming heartbeat with software PWM and falls
-back to plain on/off patterns when the machine cannot toggle fast enough.
+`blinky` turns ThinkPad status LEDs (`tpacpi::power`, `tpacpi::thinkvantage`, `tpacpi::lid_logo_dot`, `tpacpi::standby`) and the integrated webcam indicator into live status lamps for coding agents:
+- **Running / Heartbeat**: slow steady blink, smoothly fading in and out via software PWM
+- **Needs-input**: fast triple-blink alert (and optional webcam LED solid indicator)
+- **Done**: three clean finish flashes, then settles
+- **Error**: Morse SOS pattern
+- **Clean exit & idle**: restores the exact LED status that existed before the notification/toggle
 
 ```
- 60 bpm heartbeat                 needs-input              running
-    ▁▃▅▂▁▁▃▅▂▁▁                    ▌▌▌  ▁▁▁▁▁                ▁▃▅▇▅▃▁▁▃▅▇
- (PWM duty follows the envelope)  (triple blink)        (slow breathing)
+ Slow steady blink (fade in & out)     needs-input               error (SOS)
+        ▁▃▅▇█▇▅▃▁▁                     ▌▌▌  ▁▁▁▁▁                ▄ ▄ ▄  █ █ █  ▄ ▄ ▄
+ (smooth gamma-corrected fade)       (triple blink)            (... --- ...)
 ```
+
+---
+
+## Hardware & Architecture
+
+### ThinkPad xx30 (X230, T430, W530) ThinkLight Limitation
+On xx30 ThinkPads, the ThinkLight (`tpacpi::thinklight`) **cannot be turned on via software**.
+Lenovo removed the ACPI `lght` method, leaving `thinkpad_acpi` to use legacy UCMS/CMOS commands 12/13. In firmware, writing `1` is a silent no-op; only `0` (off) works from Linux. The flood light can only be turned on by the hardware EC hotkey (`Fn+Space` / `Fn+PgUp`).
+
+### Supported LEDs
+`blinky` drives the LEDs that *do* work:
+- `tpacpi::power` (**default** — power button LED, visible next to keyboard)
+- `tpacpi::thinkvantage` (blue ThinkVantage button LED)
+- `tpacpi::lid_logo_dot` (red dot in the ThinkPad lid logo)
+- `tpacpi::standby` (crescent moon sleep LED)
+
+All probe at >400,000 toggles/s via sysfs and support smooth software PWM dimming.
+
+### Webcam Indicator
+The integrated webcam (Bison `5986:02d2`, `/dev/video0`) has no independent LED sysfs control (`V4L2_CID_PRIVACY` does not light it). It only lights when an active video stream is running. `blinky webcam watch` polls status and streams `v4l2-ctl` while agents are in urgent states (`needs-input,error`), providing a bright binary green indicator lamp.
+
+---
 
 ## Install
 
 ```sh
 make
 sudo ./install.sh          # installs binary + udev rule + trigger modules
-blinky calibrate           # verify write access and PWM feasibility
-blinky pattern heartbeat   # look at the lid
+blinky probe               # verify LED access, toggles/s, and readback
+blinky pattern running     # test the slow steady fade
 ```
 
-Without root you can still build and run the test suite:
+Non-root install copies the binary to `~/.local/bin/blinky` and installs systemd user units to `~/.config/systemd/user/`.
+
+Run the test suite anytime without root:
 
 ```sh
 bash tests/run.sh
 ```
 
-The udev rule grants write access to the LED (an LED is not sensitive, so `0666`).
-The `ledtrig-*` modules are preloaded for the optional kernel-trigger mode.
+---
 
 ## Usage
 
 ```sh
 blinky set <agent> <state>     # running | needs-input | done | error | off
-blinky pattern <name>          # force a pattern for testing
+blinky pattern <name>          # force a pattern: running | heartbeat | needs-input | done | error | off
 blinky off [agent]             # clear one agent or all
-blinky pause | resume
-blinky status                  # daemon + current pattern
-blinky start | stop
-blinky led on|off              # raw write, bypasses the daemon
-blinky calibrate               # measure max toggle rate / PWM support
+blinky pause | resume          # temporarily suspend LED updates
+blinky status                  # daemon status, active pattern, and webcam state
+blinky start | stop            # start daemon in background / stop all daemons
+blinky led on|off              # raw direct write, bypasses daemon
+blinky calibrate               # measure max toggle rate and PWM feasibility
+blinky probe                   # probe all candidate LEDs and toggle frequencies
+blinky webcam on|off|watch|status [dev]  # manage webcam status indicator
 ```
 
-States are per agent and arbitrated by urgency, so several running agents in
-several tmux panes collapse to one sensible light:
+### State Arbitration
+Per-agent states are arbitrated by priority. Multiple agents running across terminal panes or tmux sessions collapse into the most urgent state:
 
 ```
 needs-input  >  error  >  running  >  done  >  off
 ```
 
-`blinky set` starts the daemon on first use. A user service is provided in
-`systemd/blinky.service` if you want it up from login.
+### Pre-existing State Restoration
+When all agent notifications clear (`off` or `done`), or when the daemon exits (`blinky stop` or SIGTERM/SIGINT), `blinky` automatically restores every LED to its original pre-existing status (e.g. keeping `tpacpi::power` illuminated if it was ON before the agent ran).
 
-## Agent integration
+---
 
-`blinky` is deliberately a dumb sink. Point your existing notify hook at it.
-If you use `agent-notify.sh`, append one line:
+## Systemd Services
 
-```sh
-[ -x "$HOME/.local/bin/blinky" ] && blinky set "$AGENT" "$STATE" &
-```
-
-That is enough for OpenCode (its plugin already calls `agent-notify.sh`). For the
-rest, fire the same command from their lifecycle hooks:
-
-| Agent | Where |
-|---|---|
-| opencode | `~/.config/opencode/plugins/` already calls `agent-notify.sh` |
-| claude | `~/.claude/settings.json` hooks: `Stop`, `Notification`, `PreToolUse`, `SessionEnd` |
-| codex | `~/.codex/hooks.json` (or its `notify` program) |
-| agy / antigravity | `~/.gemini/config/hooks.json` (`PreInvocation` / `AfterInvocation`) |
-| pi | `~/.pi/agent/extensions/*.ts`: `agent_start` → running, `ask_user_question` → needs-input, `agent_settled` → done, `session_shutdown` → off |
-
-Direct use is fine too:
+Enable the daemon and optional webcam watcher at login:
 
 ```sh
-blinky set pi running
-blinky set pi needs-input
-blinky set pi done
+systemctl --user enable --now blinky.service
+systemctl --user enable --now blinky-webcam.service
 ```
 
-## Patterns
+---
 
-| Pattern | Look | Used for |
+## Agent Integration
+
+`blinky` integrates directly with coding agents through `agent-notify.sh` or lifecycle hooks:
+
+### Central Choke Point (`~/.local/bin/agent-notify.sh`)
+Add one line near the top of `agent-notify.sh`:
+```bash
+if command -v blinky >/dev/null 2>&1; then
+    blinky set "$AGENT" "$STATE" >/dev/null 2>&1 &
+fi
+```
+
+### Direct Agent Integrations
+- **Pi**: [`~/.pi/agent/extensions/blinky-indicator.ts`](file:///home/denial/.pi/agent/extensions/blinky-indicator.ts) listens to `agent_start` (running), `agent_settled` (done), and `session_shutdown` (off).
+- **OpenCode**: [`~/.config/opencode/plugins/opencode-tmux-agent-indicator.js`](file:///home/denial/.config/opencode/plugins/opencode-tmux-agent-indicator.js) already invokes `agent-notify.sh`.
+- **Claude / Codex / Antigravity**: invoke `blinky set <agent> <state>` from `PreInvocation`, `PostInvocation`, or lifecycle hook scripts.
+
+---
+
+## Environment Variables
+
+| Variable | Default | Meaning |
 |---|---|---|
-| `heartbeat` | two-thump cardiac pulse, PWM dimming | manual / demo |
-| `running` | slow breathing | agent working |
-| `needs-input` | triple blink | agent blocked on you |
-| `done` | three flashes then dark | agent finished |
-| `error` | SOS | failure |
-| `off` | dark | everything idle |
+| `BLINKY_LED` | `tpacpi::power` | LED target: short name, comma-separated list, `auto`, or sysfs path |
+| `BLINKY_BASE` | `$XDG_RUNTIME_DIR/blinky` | Base runtime directory for FIFO, PID, and status files |
+| `BLINKY_PWM` | `1` | Set `0` to disable PWM and force binary square-wave patterns |
+| `BLINKY_PWM_HZ` | `100` | Carrier frequency for software PWM |
+| `BLINKY_RECALIBRATE` | `0` | Set `1` to bypass cached calibration and re-measure |
+| `BLINKY_WEBCAM_DEV` | `/dev/video0` | Video device node for webcam streaming indicator |
+| `BLINKY_WEBCAM_STATES`| `needs-input,error` | Comma-separated agent states that trigger webcam light |
 
-## Environment
+---
 
-| Variable | Meaning |
-|---|---|
-| `BLINKY_LED` | LED path (default `/sys/class/leds/tpacpi::thinklight/brightness`) |
-| `BLINKY_BASE` | runtime dir override (default `$XDG_RUNTIME_DIR/blinky`) |
-| `BLINKY_PWM` | `0` disables PWM, forcing binary patterns |
-| `BLINKY_PWM_HZ` | carrier frequency, default `100` |
-| `BLINKY_RECALIBRATE` | ignore the cached calibration and re-measure |
+## Demo & Investigation
 
-## How it works
+Run the interactive demo script to test all patterns and timings on physical hardware:
 
-- A foreground daemon owns the LED and a FIFO (`$XDG_RUNTIME_DIR/blinky/cmd`).
-- Per-agent state is kept in memory; the most urgent state wins.
-- Each frame (default 100 Hz) computes a duty cycle from the active pattern and,
-  in PWM mode, holds the LED on for `duty * period` and off for the rest.
-- Startup calibration measures the maximum toggle rate of the LED. PWM is used
-  when the ceiling is at least `1.5 x 2 x carrier`; otherwise the same patterns
-  are rendered as on/off. The result is cached in `$XDG_RUNTIME_DIR/blinky/calib`
-  so the light does not flicker on every start.
-- The `timer` / `pattern` kernel LED triggers are an optional zero-CPU
-  alternative; `blinky` does not require them.
+```sh
+tools/demo.sh [led-path] [loops]
+```
+*(Automatically captures and restores initial LED state on exit).*
 
-## Limitations
-
-- **It is a binary LED.** Any "dimming" is PWM and shows some flicker at low
-  carrier frequencies. There is no true brightness register.
-- Every toggle is one ACPI call, so PWM costs CPU and EC traffic. Keep the
-  carrier around 100 Hz; do not drive it at kHz.
-- `Fn+PgUp` toggles the same LED; the daemon will override it. Use
-  `blinky pause` before you want manual control.
-- The LED may lose state across suspend/resume; re-issue the current state.
-- Direct EC register poking can do a much faster PWM (see the `thinkled`
-  project), but the ThinkLight's register is not publicly mapped on the X230 and
-  the EC has documented init races. Not worth the risk for a status lamp.
-
-See `REPORT.md` for the full firmware/kernel investigation.
+See [`REPORT.md`](file:///home/denial/Projects/blinky/REPORT.md) for full kernel source verification, firmware analysis, and benchmark measurements.

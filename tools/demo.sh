@@ -12,9 +12,23 @@
 #   PWM10   : 10 Hz software PWM, 2s breathing sine, 6s
 
 set -u
-LED="${1:-/sys/class/leds/tpacpi::thinklight/brightness}"
+LED="${1:-/sys/class/leds/tpacpi::power/brightness}"
 TRIG="${LED%/brightness}/trigger"
 LOOPS="${2:-2}"
+
+ORIG_VAL=$(cat "$LED" 2>/dev/null || echo 0)
+ORIG_TRIG=""
+if [ -f "$TRIG" ]; then
+    ORIG_TRIG=$(sed -n 's/.*\[\([^]]*\)\].*/\1/p' "$TRIG" 2>/dev/null || echo none)
+fi
+
+cleanup() {
+    if [ -n "$ORIG_TRIG" ] && [ -w "$TRIG" ]; then
+        echo "$ORIG_TRIG" > "$TRIG" 2>/dev/null || true
+    fi
+    printf '%s\n' "$ORIG_VAL" > "$LED" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM HUP
 
 w() { printf '%s\n' "$1" > "$LED" 2>/dev/null || return 1; }
 
