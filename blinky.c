@@ -1,11 +1,17 @@
-// blinky - ThinkPad ThinkLight status indicator for coding agents.
+// blinky - ThinkPad status LEDs for coding agents.
 //
-// One LED (tpacpi::thinklight) is binary: max_brightness == 1.  There is no
-// hardware dimming and no hardware blink.  To fake a dimming heartbeat we run
-// software PWM and vary the duty cycle.  The achievable carrier frequency is
-// bounded by how fast we can poke the LED through thinkpad_acpi (one ACPI call
-// per toggle), so we calibrate at startup and fall back to plain on/off
-// patterns when PWM is too slow to look like dimming.
+// Originally aimed at the ThinkLight flood lamp.  On xx30 ThinkPads (X230,
+// T430...) the kernel driver can only ever turn the ThinkLight *off* through
+// sysfs: tp_features.light is satisfied by the deprecated UCMS/CMOS
+// compatibility path, so a write of 1 is silently a no-op.  Only the Fn hotkey
+// (handled by the EC) can turn it on.  Software dimming of the ThinkLight is
+// therefore impossible on this generation.
+//
+// blinky drives the LEDs that *do* work instead: tpacpi::thinkvantage,
+// tpacpi::power, tpacpi::standby and tpacpi::lid_logo_dot.  They are binary
+// too (no brightness register), so brightness is faked with software PWM.
+// Startup calibration measures the achievable toggle rate and falls back to
+// plain on/off patterns when PWM is too slow to look like dimming.
 //
 // Control surface: a FIFO.  `blinky set <agent> <state>` appends one line; the
 // daemon keeps per-agent state and renders the most urgent one.
@@ -26,6 +32,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -33,7 +40,8 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-#define DEFAULT_LED "/sys/class/leds/tpacpi::thinklight/brightness"
+#define LED_DIR "/sys/class/leds/"
+#define MAX_LEDS 8
 #define MAX_AGENTS 64
 #define LINE_MAX_ 512
 
@@ -174,13 +182,42 @@ static double pattern_duty(int p, double t_ms, bool pwm)
 	return clamp01(d);
 }
 
-/* --------------------------------------------------------------------- led */
+/* --------------------------------------------------------------------- leds */
 
 struct led {
 	int fd;
 	int shadow; /* last written value, -1 unknown */
-	const char *path;
+	char path[256];
 	bool warned;
+};
+
+/* ------------------------------------------------------------- state store */
+
+enum { A_OFF = 0, A_RUNNING, A_NEEDS, A_DONE, A_ERROR };
+
+struct agent {
+	char name[40];
+	int state;
+};
+
+struct world {
+	struct agent agents[MAX_AGENTS];
+	int nagents;
+	int forced; /* -1 = none, else forced pattern */
+	bool paused;
+	struct led leds[MAX_LEDS];
+	int nleds;
+};
+
+// LEDs that actually respond on an X230.  The ThinkLight is deliberately not
+// in this list: it can only be switched off from software.  Add it explicitly
+// if you want to use it as a "force off" target.
+static const char *LED_CANDIDATES[] = {
+	"tpacpi::thinkvantage",
+	"tpacpi::lid_logo_dot",
+	"tpacpi::power",
+	"tpacpi::standby",
+	NULL,
 };
 
 static void led_write(struct led *l, int on)
@@ -203,44 +240,67 @@ static void led_write(struct led *l, int on)
 	l->shadow = on;
 }
 
-// Measure toggles/second of the LED path.  Also proves write access.
+// Measure toggles/second of one LED.  Also proves write access.
 static double led_calibrate(struct led *l)
 {
-	const int n = 400;
-	uint64_t t0, t1;
-	for (int i = 0; i < 16; i++) { /* warm up */
-		led_write(l, 1);
-		led_write(l, 0);
+	const int n = 300;
+	double best = 0;
+	for (int round = 0; round < 3; round++) {
+		uint64_t t0, t1;
+		for (int i = 0; i < 8; i++) { /* warm up */
+			led_write(l, 1);
+			led_write(l, 0);
+		}
+		t0 = now_ns();
+		for (int i = 0; i < n; i++) {
+			led_write(l, 1);
+			led_write(l, 0);
+		}
+		t1 = now_ns();
+		double sec = (double)(t1 - t0) / 1e9;
+		if (sec > 0) {
+			double hz = (double)(2 * n) / sec;
+			if (hz > best)
+				best = hz;
+		}
 	}
-	t0 = now_ns();
-	for (int i = 0; i < n; i++) {
-		led_write(l, 1);
-		led_write(l, 0);
-	}
-	t1 = now_ns();
 	led_write(l, 0);
-	double sec = (double)(t1 - t0) / 1e9;
-	if (sec <= 0)
-		return 0;
-	return (double)(2 * n) / sec;
+	return best;
 }
 
-/* ------------------------------------------------------------- state store */
+static struct led *led_open(struct led *arr, int *n, const char *path)
+{
+	if (*n >= MAX_LEDS)
+		return NULL;
+	struct led *l = &arr[*n];
+	memset(l, 0, sizeof(*l));
+	snprintf(l->path, sizeof(l->path), "%s", path);
+	l->fd = open(path, O_WRONLY);
+	l->shadow = -1;
+	if (l->fd < 0)
+		return NULL;
+	(*n)++;
+	return l;
+}
 
-enum { A_OFF = 0, A_RUNNING, A_NEEDS, A_DONE, A_ERROR };
+// Resolve "tpacpi::power" or an absolute path to a brightness file.
+static void resolve_led(const char *tok, char *out, size_t n)
+{
+	if (strchr(tok, '/'))
+		snprintf(out, n, "%s", tok);
+	else
+		snprintf(out, n, LED_DIR "%s/brightness", tok);
+}
 
-struct agent {
-	char name[40];
-	int state;
-};
+// "auto" (or unset) opens every writable candidate; otherwise a comma-separated
+// list of short names or paths.  Returns the number of LEDs opened.
+static int leds_configure(struct world *w, const char *spec);
 
-struct world {
-	struct agent agents[MAX_AGENTS];
-	int nagents;
-	int forced;      /* -1 = none, else forced pattern */
-	bool paused;
-	struct led led;
-};
+static void leds_write(struct world *w, int on)
+{
+	for (int i = 0; i < w->nleds; i++)
+		led_write(&w->leds[i], on);
+}
 
 static int agent_state_from_name(const char *s)
 {
@@ -402,8 +462,8 @@ static void handle_command(struct world *w, char *line)
 static void write_status(const struct paths *p, const struct world *w, int dom, bool pwm, double hz)
 {
 	char buf[256];
-	snprintf(buf, sizeof(buf), "%s pwm=%s max_toggle_hz=%.0f agents=%d\n",
-		 pattern_name(dom), pwm ? "on" : "off", hz, w->nagents);
+	snprintf(buf, sizeof(buf), "%s pwm=%s max_toggle_hz=%.0f leds=%d agents=%d\n",
+		 pattern_name(dom), pwm ? "on" : "off", hz, w->nleds, w->nagents);
 	int fd = open(p->status, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
 	if (fd >= 0) {
 		(void)!write(fd, buf, strlen(buf));
@@ -425,26 +485,20 @@ static int cmd_daemon(void)
 		return 0;
 	}
 
-	const char *ledpath = getenv("BLINKY_LED");
-	if (!ledpath || !*ledpath)
-		ledpath = DEFAULT_LED;
-
 	struct world w;
 	memset(&w, 0, sizeof(w));
 	w.forced = -1;
-	struct led *l = &w.led;
-	l->fd = open(ledpath, O_WRONLY);
-	l->shadow = -1;
-	l->path = ledpath;
-	if (l->fd < 0) {
+	const char *spec = getenv("BLINKY_LED");
+	if (!leds_configure(&w, spec)) {
 		fprintf(stderr,
-			"blinky: cannot open %s: %s\n"
-			"        run ./install.sh once (root) to grant access via udev.\n",
-			ledpath, strerror(errno));
+			"blinky: no writable LED found (BLINKY_LED=%s)\n"
+			"        run ./install.sh once (root) to grant access via udev,\n"
+			"        then `blinky probe` to see what is usable.\n",
+			spec && *spec ? spec : "auto");
 		return 1;
 	}
 
-	// Measuring flashes the lamp ~400 times, so cache the result per machine.
+	// Measuring flashes the LEDs, so cache the slowest rate per machine.
 	double hz = 0;
 	bool recal = getenv("BLINKY_RECALIBRATE") != NULL;
 	if (!recal) {
@@ -457,16 +511,22 @@ static int cmd_daemon(void)
 		}
 	}
 	if (hz <= 0) {
-		hz = led_calibrate(l);
+		hz = 1e9;
+		for (int i = 0; i < w.nleds; i++) {
+			double h = led_calibrate(&w.leds[i]);
+			if (h < hz)
+				hz = h;
+		}
 		FILE *cf = fopen(p.calib, "w");
 		if (cf) {
 			fprintf(cf, "%.3f\n", hz);
 			fclose(cf);
 		}
 	} else {
-		led_write(l, 1);
-		led_write(l, 0);
+		leds_write(&w, 1);
+		leds_write(&w, 0);
 	}
+
 	const char *pm = getenv("BLINKY_PWM");
 	bool want_pwm = !(pm && (!strcmp(pm, "0") || !strcmp(pm, "off") || !strcmp(pm, "no")));
 	double carrier = 100.0;
@@ -498,9 +558,11 @@ static int cmd_daemon(void)
 	signal(SIGINT, on_signal);
 	signal(SIGPIPE, SIG_IGN);
 
-	fprintf(stderr,
-		"blinky: led=%s max_toggle=%.0fHz pwm=%s (carrier %.0fHz)\n",
-		ledpath, hz, pwm ? "yes" : "no", carrier);
+	fprintf(stderr, "blinky: leds=%d slowest_toggle=%.0fHz pwm=%s (carrier %.0fHz) paths=",
+		w.nleds, hz, pwm ? "yes" : "no", carrier);
+	for (int i = 0; i < w.nleds; i++)
+		fprintf(stderr, "%s%s", i ? "," : "", w.leds[i].path);
+	fprintf(stderr, "\n");
 
 	const uint64_t frame_ns = (uint64_t)(1e9 / carrier);
 	double frame_ms = (double)frame_ns / 1e6;
@@ -549,19 +611,19 @@ static int cmd_daemon(void)
 		double duty = pattern_duty(dom, t_ms, pwm);
 
 		if (!pwm) {
-			led_write(l, duty > 0.5);
+			leds_write(&w, duty > 0.5);
 		} else {
 			double on_ms = duty * frame_ms;
 			if (on_ms <= 0.4) {
-				led_write(l, 0);
+				leds_write(&w, 0);
 				sleep_ms(frame_ms);
 			} else if (on_ms >= frame_ms - 0.4) {
-				led_write(l, 1);
+				leds_write(&w, 1);
 				sleep_ms(frame_ms);
 			} else {
-				led_write(l, 1);
+				leds_write(&w, 1);
 				sleep_ms(on_ms);
-				led_write(l, 0);
+				leds_write(&w, 0);
 				sleep_ms(frame_ms - on_ms);
 			}
 		}
@@ -571,9 +633,9 @@ static int cmd_daemon(void)
 			next = now_ns();
 	}
 
-	led_write(l, 0);
-	if (l->fd >= 0)
-		close(l->fd);
+	leds_write(&w, 0);
+	for (int i = 0; i < w.nleds; i++)
+		close(w.leds[i].fd);
 	close(fifo);
 	unlink(p.fifo);
 	unlink(p.pid);
@@ -582,6 +644,33 @@ static int cmd_daemon(void)
 }
 
 /* ---------------------------------------------------------------------- cli */
+
+static int leds_configure(struct world *w, const char *spec)
+{
+	w->nleds = 0;
+	if (!spec || !*spec || !strcmp(spec, "auto") || !strcmp(spec, "all")) {
+		for (int i = 0; LED_CANDIDATES[i]; i++) {
+			char path[256];
+			resolve_led(LED_CANDIDATES[i], path, sizeof(path));
+			led_open(w->leds, &w->nleds, path);
+		}
+		return w->nleds;
+	}
+	char *copy = strdup(spec);
+	if (!copy)
+		return 0;
+	char *save = NULL;
+	for (char *tok = strtok_r(copy, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+		while (*tok == ' ')
+			tok++;
+		char path[256];
+		resolve_led(tok, path, sizeof(path));
+		if (!led_open(w->leds, &w->nleds, path))
+			fprintf(stderr, "blinky: cannot open %s: %s\n", path, strerror(errno));
+	}
+	free(copy);
+	return w->nleds;
+}
 
 static int send_line(const char *line, bool autostart)
 {
@@ -645,8 +734,7 @@ static int cmd_status(void)
 	struct paths p;
 	make_paths(&p);
 	pid_t pid = read_pid(p.pid);
-	printf("daemon: %s%s\n", pid_alive(pid) ? "running" : "stopped",
-	       pid_alive(pid) ? "" : "");
+	printf("daemon: %s\n", pid_alive(pid) ? "running" : "stopped");
 	char buf[512];
 	int fd = open(p.status, O_RDONLY);
 	if (fd >= 0) {
@@ -664,33 +752,72 @@ static int cmd_led(int argc, char **argv)
 {
 	if (argc < 1)
 		return 1;
-	const char *ledpath = getenv("BLINKY_LED");
-	if (!ledpath || !*ledpath)
-		ledpath = DEFAULT_LED;
-	struct led l = { .fd = open(ledpath, O_WRONLY), .shadow = -1, .path = ledpath };
-	if (l.fd < 0) {
-		fprintf(stderr, "blinky: cannot open %s: %s\n", ledpath, strerror(errno));
+	struct world w;
+	memset(&w, 0, sizeof(w));
+	if (!leds_configure(&w, getenv("BLINKY_LED"))) {
+		fprintf(stderr, "blinky: no writable LED\n");
 		return 1;
 	}
-	led_write(&l, !strcmp(argv[0], "on") || !strcmp(argv[0], "1"));
-	close(l.fd);
+	int on = !strcmp(argv[0], "on") || !strcmp(argv[0], "1");
+	leds_write(&w, on);
+	for (int i = 0; i < w.nleds; i++)
+		close(w.leds[i].fd);
 	return 0;
 }
 
 static int cmd_calibrate(void)
 {
-	const char *ledpath = getenv("BLINKY_LED");
-	if (!ledpath || !*ledpath)
-		ledpath = DEFAULT_LED;
-	struct led l = { .fd = open(ledpath, O_WRONLY), .shadow = -1, .path = ledpath };
-	if (l.fd < 0) {
-		fprintf(stderr, "blinky: cannot open %s: %s\n", ledpath, strerror(errno));
+	struct world w;
+	memset(&w, 0, sizeof(w));
+	if (!leds_configure(&w, getenv("BLINKY_LED"))) {
+		fprintf(stderr, "blinky: no writable LED\n");
 		return 1;
 	}
-	double hz = led_calibrate(&l);
-	close(l.fd);
-	printf("%.0f toggles/sec on %s\n", hz, ledpath);
-	printf("pwm@100Hz: %s\n", hz >= 300 ? "yes" : "no (binary patterns only)");
+	double slowest = 1e9;
+	for (int i = 0; i < w.nleds; i++) {
+		double hz = led_calibrate(&w.leds[i]);
+		if (hz < slowest)
+			slowest = hz;
+		printf("%9.0f toggles/sec  %s\n", hz, w.leds[i].path);
+	}
+	printf("---\nslowest: %.0f toggles/sec\n", slowest);
+	printf("pwm@100Hz: %s\n", slowest >= 300 ? "yes" : "no (binary patterns only)");
+	for (int i = 0; i < w.nleds; i++)
+		close(w.leds[i].fd);
+	return 0;
+}
+
+static int cmd_probe(void)
+{
+	printf("%-26s %-10s %-12s %s\n", "led", "access", "toggles/s", "readback");
+	for (int i = 0; LED_CANDIDATES[i]; i++) {
+		char path[256];
+		resolve_led(LED_CANDIDATES[i], path, sizeof(path));
+		struct led l = { .fd = open(path, O_WRONLY), .shadow = -1 };
+		snprintf(l.path, sizeof(l.path), "%s", path);
+		if (l.fd < 0) {
+			printf("%-26s %-10s %-12s %s\n", LED_CANDIDATES[i], "denied", "-", "-");
+			continue;
+		}
+		double hz = led_calibrate(&l);
+		led_write(&l, 1);
+		char rb[8] = "-";
+		int rfd = open(path, O_RDONLY);
+		if (rfd >= 0) {
+			ssize_t n = read(rfd, rb, sizeof(rb) - 1);
+			if (n > 0) {
+				rb[n] = '\0';
+				char *nl = strchr(rb, '\n');
+				if (nl)
+					*nl = '\0';
+			}
+			close(rfd);
+		}
+		led_write(&l, 0);
+		printf("%-26s %-10s %-12.0f %s\n", LED_CANDIDATES[i], "ok", hz, rb);
+		close(l.fd);
+	}
+	printf("\nnote: tpacpi::thinklight only accepts 0 (off) on xx30 hardware.\n");
 	return 0;
 }
 
@@ -705,8 +832,10 @@ static void usage(void)
 		"  status | start | stop\n"
 		"  led on|off            raw write, bypasses the daemon\n"
 		"  calibrate             measure max toggle rate / PWM feasibility\n"
+		"  probe                 list LEDs, access and toggle rate\n"
 		"  daemon                run in the foreground\n"
-		"env: BLINKY_LED BLINKY_BASE BLINKY_PWM BLINKY_PWM_HZ\n");
+		"env: BLINKY_LED (auto | tpacpi::thinkvantage,tpacpi::power | path,...)\n"
+		"     BLINKY_BASE BLINKY_PWM BLINKY_PWM_HZ BLINKY_RECALIBRATE\n");
 }
 
 int main(int argc, char **argv)
@@ -720,6 +849,8 @@ int main(int argc, char **argv)
 		return cmd_daemon();
 	if (!strcmp(cmd, "calibrate"))
 		return cmd_calibrate();
+	if (!strcmp(cmd, "probe"))
+		return cmd_probe();
 	if (!strcmp(cmd, "led"))
 		return cmd_led(argc - 2, argv + 2);
 	if (!strcmp(cmd, "status"))

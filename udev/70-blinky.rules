@@ -1,6 +1,18 @@
-# Grant the logged-in user write access to the ThinkLight and lid-dot LEDs so
-# blinky can drive them without root.  An LED is not a sensitive resource, so
-# 0666 is an acceptable trade-off; swap for chown if you prefer.
-SUBSYSTEM=="leds", KERNEL=="tpacpi::thinklight", RUN+="/bin/chmod 0666 /sys/class/leds/tpacpi::thinklight/brightness"
-SUBSYSTEM=="leds", KERNEL=="tpacpi::thinklight", RUN+="/bin/chmod 0666 /sys/class/leds/tpacpi::thinklight/trigger"
+# Grant the logged-in user write access to the controllable ThinkPad status
+# LEDs so blinky can drive them without root.  An LED is not a sensitive
+# resource, so 0666 is an acceptable trade-off; swap for chown if you prefer.
+#
+# Note: tpacpi::thinklight is included for completeness, but on xx30 (X230/T430)
+# the kernel can only turn it OFF from software: the driver falls back to the
+# deprecated UCMS/CMOS compatibility path for models without the ACPI lght
+# method.  Use thinkvantage / power / standby / lid_logo_dot instead.
+SUBSYSTEM=="leds", KERNEL=="tpacpi::thinklight",   RUN+="/bin/chmod 0666 /sys/class/leds/tpacpi::thinklight/brightness"
+SUBSYSTEM=="leds", KERNEL=="tpacpi::thinklight",   RUN+="/bin/chmod 0666 /sys/class/leds/tpacpi::thinklight/trigger"
+SUBSYSTEM=="leds", KERNEL=="tpacpi::thinkvantage", RUN+="/bin/chmod 0666 /sys/class/leds/tpacpi::thinkvantage/brightness"
+SUBSYSTEM=="leds", KERNEL=="tpacpi::thinkvantage", RUN+="/bin/chmod 0666 /sys/class/leds/tpacpi::thinkvantage/trigger"
+SUBSYSTEM=="leds", KERNEL=="tpacpi::power",        RUN+="/bin/chmod 0666 /sys/class/leds/tpacpi::power/brightness"
+SUBSYSTEM=="leds", KERNEL=="tpacpi::power",        RUN+="/bin/chmod 0666 /sys/class/leds/tpacpi::power/trigger"
+SUBSYSTEM=="leds", KERNEL=="tpacpi::standby",      RUN+="/bin/chmod 0666 /sys/class/leds/tpacpi::standby/brightness"
+SUBSYSTEM=="leds", KERNEL=="tpacpi::standby",      RUN+="/bin/chmod 0666 /sys/class/leds/tpacpi::standby/trigger"
 SUBSYSTEM=="leds", KERNEL=="tpacpi::lid_logo_dot", RUN+="/bin/chmod 0666 /sys/class/leds/tpacpi::lid_logo_dot/brightness"
+SUBSYSTEM=="leds", KERNEL=="tpacpi::lid_logo_dot", RUN+="/bin/chmod 0666 /sys/class/leds/tpacpi::lid_logo_dot/trigger"
