@@ -1,0 +1,10 @@
+[Unit]
+Description=blinky ThinkLight agent status indicator
+
+[Service]
+ExecStart=%h/.local/bin/blinky daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
